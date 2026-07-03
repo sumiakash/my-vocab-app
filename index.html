@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>My Vocabulary Catalog</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<style>
+  body { background: #101826; margin: 0; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #2a3752; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+const WORDS_KEY = "vocab-words";
+const APIKEY_KEY = "vocab-api-key";
+const PARTS = ["名詞", "動詞", "形容詞", "副詞", "前置詞", "熟語", "その他"];
+
+const storage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    return v === null ? null : { key, value: v };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+};
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const INTERVAL_DAYS = [0, 1, 2, 4, 7, 15, 30, 90];
+const MAX_BOX = INTERVAL_DAYS.length - 1;
+
+function normalizeEntry(w) {
+  return { box: 0, dueAt: Date.now(), lastReviewed: null, reviewCount: 0, ...w };
+}
+
+function scheduleAfterReview(entry, correct) {
+  const now = Date.now();
+  const wasDue = (entry.dueAt ?? 0) <= now;
+
+  if (correct && !wasDue) {
+    return { ...entry, lastReviewed: now, reviewCount: (entry.reviewCount ?? 0) + 1 };
+  }
+  if (correct && wasDue) {
+    const box = Math.min((entry.box ?? 0) + 1, MAX_BOX);
+    return {
+      ...entry,
+      box,
+      dueAt: now + INTERVAL_DAYS[box] * DAY_MS,
+      lastReviewed: now,
+      reviewCount: (entry.reviewCount ?? 0) + 1,
+      learned: box >= MAX_BOX,
+    };
+  }
+  return { ...entry, box: 0, dueAt: now, lastReviewed: now, reviewCount: (entry.reviewCount ?? 0) + 1, learned: false };
+}
+
+function decayIfMissed(entry) {
+  const now = Date.now();
+  const grace = DAY_MS;
+  if ((entry.box ?? 0) > 0 && entry.dueAt && now > entry.dueAt + grace) {
+    return { ...entry, box: 0, dueAt: now, learned: false };
+  }
+  return entry;
+}
+
+function formatDueDate(ts) {
+  const now = Date.now();
+  const diffDays = Math.round((ts - now) / DAY_MS);
+  if (ts <= now) return "今日";
+  if (diffDays === 1) return "明日";
+  const d = new Date(ts);
+  return d.toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" });
+}
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function callClaudeAPI(prompt, apiKey, attempt = 1) {
+  if (!apiKey) {
+    throw new Error("APIキーが設定されていません。右上の「🔑 API設定」から入力してください。");
+  }
+  let response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-5",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+      }),
+    });
+  } catch (networkErr) {
+    throw new Error(`通信エラー: ${networkErr.message || String(networkErr)}`);
+  }
+
+  const rawText = await response.text().catch(() => "");
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("APIキーが正しくないか無効です。「🔑 API設定」で確認してください。");
+    }
+    throw new Error(`APIエラー ${response.status}: ${rawText.slice(0, 300) || "(空のボディ)"}`);
+  }
+  if (!rawText || !rawText.trim()) {
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+      return callClaudeAPI(prompt, apiKey, attempt + 1);
+    }
+    throw new Error(`レスポンスの本文が${attempt}回とも空でした`);
+  }
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch (e) {
+    throw new Error(`APIレスポンスのJSON解析に失敗: ${rawText.slice(0, 300)}`);
+  }
+  const text = (data.content || []).map((b) => (b && b.type === "text" ? b.text : "")).join("").trim();
+  if (!text) throw new Error("テキストが空でした");
+  return text;
+}
+
+async function lookupWord(word, apiKey) {
+  const prompt = `英単語「${word}」について、日本語学習者向けに次のJSON形式のみで返答してください。前置きや説明、コードフェンスは一切含めず、JSONオブジェクトだけを返してください。
+
+{
+  "word": "見出し語(正しいスペルに補正して)",
+  "phonetic": "IPA発音記号。わからなければ空文字",
+  "partOfSpeech": "品詞。次のいずれか一語で: 名詞 / 動詞 / 形容詞 / 副詞 / 前置詞 / 熟語 / その他",
+  "meaningJa": "日本語での意味。簡潔に、複数あれば「;」で区切る",
+  "exampleEn": "この単語を自然に使った英語例文(1文)",
+  "exampleJa": "上の例文の日本語訳"
+}`;
+  const text = await callClaudeAPI(prompt, apiKey);
+  let clean = text.replace(/^```json\s*|^```\s*|```$/g, "").trim();
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) clean = clean.slice(start, end + 1);
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    throw new Error(`単語データのJSON解析に失敗: ${clean.slice(0, 200)}`);
+  }
+}
+
+function TabButton({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      className="relative px-4 py-2.5 text-[13px] tracking-wide font-medium rounded-t-lg transition-colors"
+      style={{ background: active ? "#17233A" : "transparent", color: active ? "#EDE6D4" : "#7C8AA3", fontFamily: "'Georgia', 'Times New Roman', serif" }}
+    >
+      {children}
+      {active && <span className="absolute left-0 right-0 -bottom-px h-[2px] rounded-full" style={{ background: "#D6A755" }} />}
+    </button>
+  );
+}
+
+function PunchHoles() {
+  return (
+    <div className="flex flex-col justify-around py-4 pl-2 pr-1 shrink-0">
+      {[0, 1, 2].map((i) => (
+        <span key={i} className="block w-2 h-2 rounded-full" style={{ background: "#0B1220", boxShadow: "inset 0 1px 2px rgba(0,0,0,0.6)" }} />
+      ))}
+    </div>
+  );
+}
+
+function WordCard({ entry, onToggleLearned, onDelete, expanded, onToggleExpand }) {
+  return (
+    <div className="flex rounded-lg overflow-hidden mb-3" style={{ background: "#17233A", border: "1px solid rgba(237,230,212,0.08)", boxShadow: "0 2px 8px rgba(0,0,0,0.25)" }}>
+      <PunchHoles />
+      <div className="flex-1 min-w-0 py-3 pr-3">
+        <div className="flex items-start justify-between gap-2">
+          <button className="text-left min-w-0 flex-1" onClick={onToggleExpand}>
+            <div className="flex items-baseline gap-2 flex-wrap">
+              <span className="text-xl leading-tight" style={{ fontFamily: "'Georgia', 'Times New Roman', serif", color: "#D6A755" }}>{entry.word}</span>
+              {entry.phonetic && <span className="text-[12px]" style={{ fontFamily: "ui-monospace, monospace", color: "#7C8AA3" }}>/{entry.phonetic}/</span>}
+            </div>
+            <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider" style={{ fontFamily: "ui-monospace, monospace", color: "#E1735C", background: "rgba(225,115,92,0.12)" }}>
+                {entry.partOfSpeech || "その他"}
+              </span>
+              <span className="text-[10px]" style={{ fontFamily: "ui-monospace, monospace", color: (entry.dueAt ?? 0) <= Date.now() ? "#D6A755" : "#4B5875" }}>
+                Lv.{entry.box ?? 0} ・次回 {formatDueDate(entry.dueAt ?? Date.now())}
+              </span>
+              {entry.learned && <span className="text-[10px]" style={{ color: "#5FA8A0" }}>● 習得済み</span>}
+            </div>
+            <p className="mt-1.5 text-[14px]" style={{ color: "#EDE6D4" }}>{entry.meaningJa}</p>
+            {expanded && (
+              <div className="mt-2 pt-2 space-y-1" style={{ borderTop: "1px solid rgba(237,230,212,0.08)" }}>
+                {entry.exampleEn && <p className="text-[13px] italic" style={{ color: "#C7CEDB" }}>{entry.exampleEn}</p>}
+                {entry.exampleJa && <p className="text-[12px]" style={{ color: "#7C8AA3" }}>{entry.exampleJa}</p>}
+              </div>
+            )}
+          </button>
+          <span className="shrink-0 mt-1 transition-transform" style={{ color: "#4B5875", transform: expanded ? "rotate(90deg)" : "none", fontSize: 16 }}>›</span>
+        </div>
+        <div className="mt-2 flex gap-2">
+          <button onClick={() => onToggleLearned(entry.id)} className="text-[11px] px-2 py-1 rounded flex items-center gap-1" style={{ background: entry.learned ? "rgba(95,168,160,0.15)" : "rgba(237,230,212,0.06)", color: entry.learned ? "#5FA8A0" : "#9AA5B8" }}>
+            ✓ {entry.learned ? "習得済み" : "未習得"}
+          </button>
+          <button onClick={() => onDelete(entry.id)} className="text-[11px] px-2 py-1 rounded flex items-center gap-1" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>
+            🗑 削除
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddView({ words, onSave, apiKey }) {
+  const [input, setInput] = useState("");
+  const [status, setStatus] = useState("idle");
+  const [preview, setPreview] = useState(null);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  const handleLookup = async () => {
+    const w = input.trim();
+    if (!w) return;
+    setStatus("loading");
+    setErrorMsg("");
+    try {
+      const result = await lookupWord(w, apiKey);
+      setPreview({ ...result, id: uid(), learned: false, addedAt: Date.now(), box: 0, dueAt: Date.now(), lastReviewed: null, reviewCount: 0 });
+      setStatus("preview");
+    } catch (e) {
+      setErrorMsg(`意味を調べられませんでした：${e.message || "もう一度試してください。"}`);
+      setStatus("error");
+    }
+  };
+
+  const handleSave = () => {
+    if (!preview) return;
+    onSave(preview);
+    setPreview(null);
+    setInput("");
+    setStatus("idle");
+  };
+
+  const updatePreview = (field, value) => setPreview((p) => ({ ...p, [field]: value }));
+  const alreadyExists = preview && words.some((w) => w.word.toLowerCase() === preview.word.toLowerCase());
+
+  return (
+    <div className="px-4 pb-8">
+      <p className="text-[13px] mt-4 mb-3" style={{ color: "#7C8AA3" }}>わからない単語を入力すると、意味と例文を調べます。</p>
+      <div className="flex gap-2">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && handleLookup()}
+          placeholder="例: ubiquitous"
+          className="flex-1 px-3 py-2.5 rounded-lg text-[15px] outline-none"
+          style={{ background: "#17233A", color: "#EDE6D4", border: "1px solid rgba(237,230,212,0.12)" }}
+        />
+        <button onClick={handleLookup} disabled={status === "loading" || !input.trim()} className="px-4 rounded-lg flex items-center gap-1.5 text-[13px] font-medium shrink-0" style={{ background: "#D6A755", color: "#101826", opacity: status === "loading" || !input.trim() ? 0.5 : 1 }}>
+          ✨ {status === "loading" ? "調べ中…" : "調べる"}
+        </button>
+      </div>
+
+      {status === "error" && <p className="mt-3 text-[13px]" style={{ color: "#E1735C" }}>{errorMsg}</p>}
+      {status === "loading" && (
+        <div className="mt-6 flex items-center gap-2 text-[13px]" style={{ color: "#7C8AA3" }}>
+          <span className="inline-block w-3 h-3 rounded-full animate-spin" style={{ border: "2px solid #4B5875", borderTopColor: "#D6A755" }} />
+          辞書を引いています…
+        </div>
+      )}
+
+      {preview && status === "preview" && (
+        <div className="mt-5 rounded-lg p-4" style={{ background: "#17233A", border: "1px solid rgba(214,167,85,0.35)" }}>
+          <div className="flex items-baseline gap-2 flex-wrap">
+            <span className="text-2xl" style={{ fontFamily: "'Georgia', serif", color: "#D6A755" }}>{preview.word}</span>
+            {preview.phonetic && <span className="text-[13px]" style={{ fontFamily: "ui-monospace, monospace", color: "#7C8AA3" }}>/{preview.phonetic}/</span>}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {PARTS.map((p) => (
+              <button key={p} onClick={() => updatePreview("partOfSpeech", p)} className="text-[11px] px-2 py-1 rounded" style={{ fontFamily: "ui-monospace, monospace", background: preview.partOfSpeech === p ? "rgba(225,115,92,0.25)" : "rgba(237,230,212,0.06)", color: preview.partOfSpeech === p ? "#E1735C" : "#7C8AA3" }}>
+                {p}
+              </button>
+            ))}
+          </div>
+          <label className="block mt-3 text-[11px] uppercase tracking-wide" style={{ color: "#7C8AA3" }}>意味</label>
+          <textarea value={preview.meaningJa} onChange={(e) => updatePreview("meaningJa", e.target.value)} rows={2} className="w-full mt-1 px-2.5 py-2 rounded text-[14px] outline-none resize-none" style={{ background: "#101826", color: "#EDE6D4", border: "1px solid rgba(237,230,212,0.1)" }} />
+          {preview.exampleEn && (
+            <>
+              <label className="block mt-3 text-[11px] uppercase tracking-wide" style={{ color: "#7C8AA3" }}>例文</label>
+              <p className="mt-1 text-[13px] italic" style={{ color: "#C7CEDB" }}>{preview.exampleEn}</p>
+              <p className="text-[12px]" style={{ color: "#7C8AA3" }}>{preview.exampleJa}</p>
+            </>
+          )}
+          {alreadyExists && <p className="mt-3 text-[12px]" style={{ color: "#E1735C" }}>この単語はすでに登録されています。保存すると新しいカードとして追加されます。</p>}
+          <div className="mt-4 flex gap-2">
+            <button onClick={handleSave} className="flex-1 py-2.5 rounded-lg text-[14px] font-medium" style={{ background: "#5FA8A0", color: "#101826" }}>単語帳に保存</button>
+            <button onClick={() => { setPreview(null); setStatus("idle"); }} className="px-4 py-2.5 rounded-lg text-[14px]" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>取り消し</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ListView({ words, onToggleLearned, onDelete }) {
+  const [query, setQuery] = useState("");
+  const [tagFilter, setTagFilter] = useState("すべて");
+  const [expandedId, setExpandedId] = useState(null);
+
+  const tags = useMemo(() => {
+    const set = new Set(words.map((w) => w.partOfSpeech || "その他"));
+    return ["すべて", ...Array.from(set)];
+  }, [words]);
+
+  const filtered = words.filter((w) => {
+    const matchesQuery = !query || w.word.toLowerCase().includes(query.toLowerCase()) || (w.meaningJa || "").includes(query);
+    const matchesTag = tagFilter === "すべて" || (w.partOfSpeech || "その他") === tagFilter;
+    return matchesQuery && matchesTag;
+  });
+
+  return (
+    <div className="px-4 pb-8">
+      <div className="mt-4 relative">
+        <span className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#7C8AA3" }}>🔍</span>
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="単語・意味で検索" className="w-full pl-9 pr-3 py-2.5 rounded-lg text-[14px] outline-none" style={{ background: "#17233A", color: "#EDE6D4", border: "1px solid rgba(237,230,212,0.12)" }} />
+      </div>
+      <div className="mt-3 flex gap-1.5 overflow-x-auto pb-1">
+        {tags.map((t) => (
+          <button key={t} onClick={() => setTagFilter(t)} className="shrink-0 text-[11px] px-2.5 py-1 rounded-full" style={{ fontFamily: "ui-monospace, monospace", background: tagFilter === t ? "#D6A755" : "rgba(237,230,212,0.06)", color: tagFilter === t ? "#101826" : "#9AA5B8" }}>
+            {t}
+          </button>
+        ))}
+      </div>
+      <p className="mt-3 mb-2 text-[12px]" style={{ color: "#4B5875" }}>{filtered.length}件 / 全{words.length}件（習得済み {words.filter((w) => w.learned).length}件）</p>
+      {filtered.length === 0 ? (
+        <div className="mt-8 text-center">
+          <p className="text-[14px]" style={{ color: "#7C8AA3" }}>{words.length === 0 ? "まだ単語が登録されていません。「追加」タブから調べてみましょう。" : "条件に一致する単語がありません。"}</p>
+        </div>
+      ) : (
+        filtered.slice().sort((a, b) => b.addedAt - a.addedAt).map((entry) => (
+          <WordCard key={entry.id} entry={entry} onToggleLearned={onToggleLearned} onDelete={onDelete} expanded={expandedId === entry.id} onToggleExpand={() => setExpandedId(expandedId === entry.id ? null : entry.id)} />
+        ))
+      )}
+    </div>
+  );
+}
+
+function Flashcards({ pool, onReviewResult }) {
+  const [order, setOrder] = useState(() => shuffle(pool.map((w) => w.id)));
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+
+  useEffect(() => { setOrder(shuffle(pool.map((w) => w.id))); setIdx(0); setFlipped(false); }, [pool.length]);
+
+  if (pool.length === 0) return null;
+  const current = pool.find((w) => w.id === order[idx]);
+  if (!current) return null;
+
+  const next = (correct) => {
+    if (correct !== undefined) onReviewResult(current.id, correct);
+    setFlipped(false);
+    setIdx((i) => (i + 1) % order.length);
+  };
+
+  return (
+    <div className="mt-4">
+      <p className="text-[12px] mb-2" style={{ color: "#4B5875" }}>{idx + 1} / {order.length}</p>
+      <button onClick={() => setFlipped((f) => !f)} className="w-full rounded-xl p-8 flex flex-col items-center justify-center text-center min-h-[220px]" style={{ background: "#17233A", border: "1px solid rgba(214,167,85,0.25)" }}>
+        {(current.dueAt ?? 0) > Date.now() && (
+          <span className="mb-3 text-[10px] px-2 py-0.5 rounded-full" style={{ background: "rgba(214,167,85,0.15)", color: "#D6A755" }}>前倒し復習・正解してもレベルは上がりません</span>
+        )}
+        {!flipped ? (
+          <>
+            <span className="text-3xl" style={{ fontFamily: "'Georgia', serif", color: "#D6A755" }}>{current.word}</span>
+            {current.phonetic && <span className="mt-2 text-[13px]" style={{ fontFamily: "ui-monospace, monospace", color: "#7C8AA3" }}>/{current.phonetic}/</span>}
+            <span className="mt-4 text-[11px]" style={{ color: "#4B5875" }}>タップして意味を見る</span>
+          </>
+        ) : (
+          <>
+            <span className="text-[16px]" style={{ color: "#EDE6D4" }}>{current.meaningJa}</span>
+            {current.exampleEn && <span className="mt-3 text-[13px] italic" style={{ color: "#C7CEDB" }}>{current.exampleEn}</span>}
+          </>
+        )}
+      </button>
+      <div className="mt-3 flex gap-2">
+        <button onClick={() => next(false)} className="flex-1 py-2.5 rounded-lg text-[13px] flex items-center justify-center gap-1.5" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>↺ もう一度</button>
+        <button onClick={() => next(true)} className="flex-1 py-2.5 rounded-lg text-[13px] flex items-center justify-center gap-1.5" style={{ background: "rgba(95,168,160,0.15)", color: "#5FA8A0" }}>✓ 覚えた</button>
+      </div>
+    </div>
+  );
+}
+
+function Quiz({ words, onReviewResult }) {
+  const [order] = useState(() => shuffle(words.map((w) => w.id)));
+  const [idx, setIdx] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [score, setScore] = useState({ correct: 0, total: 0 });
+
+  const current = words.find((w) => w.id === order[idx]);
+  const choices = useMemo(() => {
+    if (!current) return [];
+    const others = words.filter((w) => w.id !== current.id);
+    const distractors = shuffle(others).slice(0, 3).map((w) => w.meaningJa);
+    return shuffle([current.meaningJa, ...distractors]);
+  }, [current, words]);
+
+  if (!current) {
+    return (
+      <div className="mt-8 text-center">
+        <p className="text-[15px]" style={{ color: "#D6A755" }}>お疲れさまでした！</p>
+        <p className="mt-1 text-[13px]" style={{ color: "#7C8AA3" }}>{score.total}問中 {score.correct}問正解</p>
+      </div>
+    );
+  }
+
+  const handleChoice = (choice) => {
+    if (selected) return;
+    setSelected(choice);
+    const isCorrect = choice === current.meaningJa;
+    setScore((s) => ({ correct: s.correct + (isCorrect ? 1 : 0), total: s.total + 1 }));
+    onReviewResult(current.id, isCorrect);
+  };
+  const handleNext = () => { setSelected(null); setIdx((i) => i + 1); };
+
+  return (
+    <div className="mt-4">
+      <p className="text-[12px] mb-2" style={{ color: "#4B5875" }}>{idx + 1} / {order.length}　正解 {score.correct}</p>
+      <div className="rounded-xl p-6 text-center" style={{ background: "#17233A", border: "1px solid rgba(214,167,85,0.25)" }}>
+        {(current.dueAt ?? 0) > Date.now() && (
+          <span className="inline-block mb-2 text-[10px] px-2 py-0.5 rounded-full" style={{ background: "rgba(214,167,85,0.15)", color: "#D6A755" }}>前倒し復習・正解してもレベルは上がりません</span>
+        )}
+        <div>
+          <span className="text-2xl" style={{ fontFamily: "'Georgia', serif", color: "#D6A755" }}>{current.word}</span>
+          {current.phonetic && <div className="mt-1 text-[12px]" style={{ fontFamily: "ui-monospace, monospace", color: "#7C8AA3" }}>/{current.phonetic}/</div>}
+        </div>
+      </div>
+      <div className="mt-3 space-y-2">
+        {choices.map((c, i) => {
+          const isCorrectChoice = c === current.meaningJa;
+          const isSelected = selected === c;
+          let bg = "rgba(237,230,212,0.06)", color = "#EDE6D4";
+          if (selected) {
+            if (isCorrectChoice) { bg = "rgba(95,168,160,0.2)"; color = "#5FA8A0"; }
+            else if (isSelected) { bg = "rgba(225,115,92,0.2)"; color = "#E1735C"; }
+          }
+          return (
+            <button key={i} onClick={() => handleChoice(c)} className="w-full text-left px-3.5 py-2.5 rounded-lg text-[14px]" style={{ background: bg, color }}>{c}</button>
+          );
+        })}
+      </div>
+      {selected && <button onClick={handleNext} className="mt-3 w-full py-2.5 rounded-lg text-[13px] font-medium" style={{ background: "#D6A755", color: "#101826" }}>次へ</button>}
+    </div>
+  );
+}
+
+function ModeSwitch({ mode, setMode, scope, setScope }) {
+  return (
+    <div className="mt-4 flex items-center justify-between">
+      <div className="flex gap-1.5">
+        <button onClick={() => setMode("flashcard")} className="text-[12px] px-3 py-1.5 rounded-full flex items-center gap-1" style={{ background: mode === "flashcard" ? "#D6A755" : "rgba(237,230,212,0.06)", color: mode === "flashcard" ? "#101826" : "#9AA5B8" }}>📚 カード</button>
+        <button onClick={() => setMode("quiz")} className="text-[12px] px-3 py-1.5 rounded-full flex items-center gap-1" style={{ background: mode === "quiz" ? "#D6A755" : "rgba(237,230,212,0.06)", color: mode === "quiz" ? "#101826" : "#9AA5B8" }}>🔀 テスト</button>
+      </div>
+      <select value={scope} onChange={(e) => setScope(e.target.value)} className="text-[11px] px-2 py-1.5 rounded outline-none" style={{ background: "#17233A", color: "#9AA5B8", border: "1px solid rgba(237,230,212,0.1)" }}>
+        <option value="due">今日の分</option>
+        <option value="all">すべて</option>
+      </select>
+    </div>
+  );
+}
+
+function ReviewView({ words, onReviewResult }) {
+  const [mode, setMode] = useState("flashcard");
+  const [scope, setScope] = useState("due");
+  const dueWords = useMemo(() => words.filter((w) => (w.dueAt ?? 0) <= Date.now()), [words]);
+  const pool = scope === "due" ? dueWords : words;
+
+  if (words.length === 0) {
+    return (
+      <div className="px-4 pb-8 mt-8 text-center">
+        <div style={{ fontSize: 28 }} className="mb-3">📖</div>
+        <p className="text-[14px]" style={{ color: "#7C8AA3" }}>復習する単語がありません。まずは単語を登録しましょう。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-4 pb-8">
+      <div className="mt-4 flex items-baseline justify-between">
+        <p className="text-[13px]" style={{ color: "#7C8AA3" }}>今日の復習: <span style={{ color: "#D6A755", fontWeight: 600 }}>{dueWords.length}件</span></p>
+        <p className="text-[11px]" style={{ color: "#4B5875" }}>忘却曲線に沿って自動出題</p>
+      </div>
+      <ModeSwitch mode={mode} setMode={setMode} scope={scope} setScope={setScope} />
+      {mode === "quiz" && pool.length < 4 ? (
+        <p className="mt-8 text-center text-[13px]" style={{ color: "#7C8AA3" }}>
+          {scope === "due" ? "テストは4択のため、今日の復習が4件以上ある時に使えます。カードで復習するか、「すべて」に切り替えてください。" : "テスト機能は4択のため、単語を4件以上登録すると使えます。"}
+        </p>
+      ) : pool.length === 0 ? (
+        <div className="mt-8 text-center">
+          <p className="text-[14px]" style={{ color: "#EDE6D4" }}>今日復習すべき単語はありません 🎉</p>
+          <p className="mt-1 text-[12px]" style={{ color: "#7C8AA3" }}>覚えた単語はレベルに応じて先の日に自動で再登場します。</p>
+          <button onClick={() => setScope("all")} className="mt-4 text-[12px] px-3 py-1.5 rounded-full" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>前倒しで「すべて」を復習する</button>
+        </div>
+      ) : mode === "flashcard" ? (
+        <Flashcards key={scope} pool={pool} onReviewResult={onReviewResult} />
+      ) : (
+        <Quiz key={scope + "-quiz"} words={pool} onReviewResult={onReviewResult} />
+      )}
+    </div>
+  );
+}
+
+function ApiKeyPanel({ apiKey, setApiKey }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(apiKey);
+
+  const masked = apiKey ? `${apiKey.slice(0, 7)}...${apiKey.slice(-4)}` : "未設定";
+
+  return (
+    <div className="px-4">
+      <button onClick={() => setOpen((o) => !o)} className="text-[11px] px-2 py-1 rounded flex items-center gap-1" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>
+        🔑 API設定 {apiKey ? "(設定済み)" : "(未設定)"}
+      </button>
+      {open && (
+        <div className="mt-2 p-3 rounded-lg" style={{ background: "#17233A", border: "1px solid rgba(237,230,212,0.12)" }}>
+          <p className="text-[11px] mb-1" style={{ color: "#7C8AA3" }}>現在のキー: {masked}</p>
+          <input
+            type="password"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="sk-ant-..."
+            className="w-full px-2.5 py-2 rounded text-[13px] outline-none"
+            style={{ background: "#101826", color: "#EDE6D4", border: "1px solid rgba(237,230,212,0.1)", fontFamily: "ui-monospace, monospace" }}
+          />
+          <p className="mt-1.5 text-[10px]" style={{ color: "#4B5875" }}>
+            console.anthropic.com で発行したAPIキーを貼り付けてください。このブラウザのlocalStorageにのみ保存されます。
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => { setApiKey(draft.trim()); setOpen(false); }} className="text-[12px] px-3 py-1.5 rounded-lg font-medium" style={{ background: "#D6A755", color: "#101826" }}>保存</button>
+            <button onClick={() => { setDraft(""); setApiKey(""); }} className="text-[12px] px-3 py-1.5 rounded-lg" style={{ background: "rgba(237,230,212,0.06)", color: "#9AA5B8" }}>削除</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VocabNotebook() {
+  const [words, setWords] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("add");
+  const [apiKey, setApiKeyState] = useState(() => localStorage.getItem(APIKEY_KEY) || "");
+
+  const setApiKey = (key) => {
+    setApiKeyState(key);
+    if (key) localStorage.setItem(APIKEY_KEY, key);
+    else localStorage.removeItem(APIKEY_KEY);
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await storage.get(WORDS_KEY);
+        if (res && res.value) {
+          const loadedWords = JSON.parse(res.value).map(normalizeEntry).map(decayIfMissed);
+          setWords(loadedWords);
+          storage.set(WORDS_KEY, JSON.stringify(loadedWords));
+        }
+      } catch (e) {}
+      finally { setLoaded(true); }
+    })();
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setWords(next);
+    try { await storage.set(WORDS_KEY, JSON.stringify(next)); } catch (e) {}
+  }, []);
+
+  const handleSave = (entry) => persist([...words, normalizeEntry(entry)]);
+
+  const handleToggleLearned = (id) => {
+    const next = words.map((w) => {
+      if (w.id !== id) return w;
+      const nowLearned = !w.learned;
+      return nowLearned
+        ? { ...w, learned: true, box: MAX_BOX, dueAt: Date.now() + INTERVAL_DAYS[MAX_BOX] * DAY_MS }
+        : { ...w, learned: false, box: 0, dueAt: Date.now() };
+    });
+    persist(next);
+  };
+
+  const handleReviewResult = (id, correct) => {
+    const next = words.map((w) => (w.id === id ? scheduleAfterReview(decayIfMissed(w), correct) : w));
+    persist(next);
+  };
+
+  const handleDelete = (id) => persist(words.filter((w) => w.id !== id));
+  const dueCount = useMemo(() => words.filter((w) => (w.dueAt ?? 0) <= Date.now()).length, [words]);
+
+  return (
+    <div className="min-h-screen w-full" style={{ background: "#101826", fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif" }}>
+      <div className="max-w-md mx-auto">
+        <header className="px-4 pt-6 pb-2 flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded flex items-center justify-center shrink-0" style={{ background: "#D6A755" }}>
+              <span style={{ fontSize: 15 }}>📖</span>
+            </div>
+            <div>
+              <h1 className="text-lg leading-tight" style={{ fontFamily: "'Georgia', 'Times New Roman', serif", color: "#EDE6D4" }}>My Vocabulary Catalog</h1>
+              <p className="text-[11px]" style={{ color: "#4B5875" }}>自分だけの英単語帳</p>
+            </div>
+          </div>
+        </header>
+
+        <ApiKeyPanel apiKey={apiKey} setApiKey={setApiKey} />
+
+        <nav className="px-4 mt-2 flex gap-1 border-b" style={{ borderColor: "rgba(237,230,212,0.08)" }}>
+          <TabButton active={tab === "add"} onClick={() => setTab("add")}><span className="inline-flex items-center gap-1">＋ 追加</span></TabButton>
+          <TabButton active={tab === "list"} onClick={() => setTab("list")}><span className="inline-flex items-center gap-1">🔍 一覧</span></TabButton>
+          <TabButton active={tab === "review"} onClick={() => setTab("review")}>
+            <span className="inline-flex items-center gap-1">
+              📚 復習
+              {dueCount > 0 && <span className="ml-0.5 text-[10px] px-1.5 rounded-full" style={{ background: "#E1735C", color: "#101826", fontFamily: "ui-monospace, monospace" }}>{dueCount}</span>}
+            </span>
+          </TabButton>
+        </nav>
+
+        {!loaded ? (
+          <div className="px-4 py-10 text-center text-[13px]" style={{ color: "#4B5875" }}>読み込み中…</div>
+        ) : (
+          <>
+            {tab === "add" && <AddView words={words} onSave={handleSave} apiKey={apiKey} />}
+            {tab === "list" && <ListView words={words} onToggleLearned={handleToggleLearned} onDelete={handleDelete} />}
+            {tab === "review" && <ReviewView words={words} onReviewResult={handleReviewResult} />}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<VocabNotebook />);
+</script>
+</body>
+</html>
