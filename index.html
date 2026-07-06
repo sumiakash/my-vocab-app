@@ -4,10 +4,14 @@
 <meta charset="UTF-8" />
 <script>
 window.onerror = function(msg, url, line, col, error) {
-  document.body.innerHTML = '<pre style="color:#fff;background:#101826;padding:20px;white-space:pre-wrap;font-size:12px;">エラー: ' + msg + '\n行: ' + line + ':' + col + '\n' + (error && error.stack ? error.stack : '') + '</pre>';
+  document.body.innerHTML = '<pre style="color:#fff;background:#101826;padding:20px;white-space:pre-wrap;font-size:12px;">エラー: ' + msg + '\n行: ' + line + ':' + col + '</pre>';
 };
+window.addEventListener('error', function(e) {
+  if (e.target && e.target.tagName === 'SCRIPT') {
+    document.body.innerHTML = '<pre style="color:#fff;background:#101826;padding:20px;white-space:pre-wrap;font-size:12px;">スクリプトの読み込みに失敗: ' + e.target.src + '</pre>';
+  }
+}, true);
 </script>
-
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>My Vocabulary Catalog</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -21,7 +25,7 @@ window.onerror = function(msg, url, line, col, error) {
 </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root">読み込み中…(これが消えなければJSが全く動いていません)</div>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useCallback, useMemo } = React;
